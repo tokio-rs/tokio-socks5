@@ -11,7 +11,7 @@ use std::time::Duration;
 use curl::easy::Easy;
 
 fn bin() -> PathBuf {
-    env::current_exe().unwrap().parent().unwrap().join("futures-socks5")
+    env::current_exe().unwrap().parent().unwrap().join("tokio-socks5")
 }
 
 struct KillOnDrop(Child);

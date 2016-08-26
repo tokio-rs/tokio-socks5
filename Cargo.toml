@@ -1,14 +1,13 @@
 [package]
-name = "futures-socks5"
+name = "tokio-socks5"
 version = "0.1.0"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 
 [dependencies]
 log = "0.3"
-futures = { path = "..", version = "0.1" }
-futures-io = { path = "../futures-io", version = "0.1" }
-futures-mio = { path = "../futures-mio", version = "0.1" }
-futures-cpupool = { path = "../futures-cpupool", version = "0.1" }
+futures = { git = "https://github.com/alexcrichton/futures-rs" }
+futures-cpupool = { git = "https://github.com/alexcrichton/futures-rs" }
+tokio-core = { git = "https://github.com/tokio-rs/tokio-core" }
 env_logger = "0.3"
 
 [dev-dependencies]

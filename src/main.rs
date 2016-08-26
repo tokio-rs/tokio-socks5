@@ -43,8 +43,7 @@ extern crate log;
 extern crate env_logger;
 #[macro_use]
 extern crate futures;
-extern crate futures_io;
-extern crate futures_mio;
+extern crate tokio_core;
 extern crate futures_cpupool;
 
 use std::cell::RefCell;
@@ -60,8 +59,8 @@ use futures::{Future, Poll};
 use futures::task;
 use futures::stream::Stream;
 use futures_cpupool::CpuPool;
-use futures_io::{IoFuture, read_exact, write_all, Window};
-use futures_mio::{Loop, LoopData, LoopHandle, TcpStream};
+use tokio_core::{Loop, LoopData, LoopHandle, TcpStream};
+use tokio_core::io::{IoFuture, read_exact, write_all, Window};
 
 fn main() {
     drop(env_logger::init());
