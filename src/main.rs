@@ -47,20 +47,19 @@ extern crate tokio_core;
 extern crate futures_cpupool;
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::net::Shutdown;
 use std::str;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{Future, Poll};
-use futures::task;
 use futures::stream::Stream;
 use futures_cpupool::CpuPool;
-use tokio_core::{Loop, LoopData, LoopHandle, TcpStream};
-use tokio_core::io::{IoFuture, read_exact, write_all, Window};
+use tokio_core::{Loop, LoopHandle, TcpStream};
+use tokio_core::io::{read_exact, write_all, Window};
 
 fn main() {
     drop(env_logger::init());
@@ -76,51 +75,33 @@ fn main() {
     // into, and finally binding the TCP listener itself.
     let mut lp = Loop::new().unwrap();
     let pool = CpuPool::new(4);
-    let buffer = GlobalBuffer::new(&lp, 64 * 1024);
-    let listener = lp.handle().tcp_listen(&addr);
+    let buffer = Rc::new(RefCell::new(vec![0; 64 * 1024]));
     let handle = lp.handle();
+    let listener = lp.run(handle.clone().tcp_listen(&addr)).unwrap();
+    let pin = lp.pin();
 
-    // Next up, we construct a future representing the entire execution of the
-    // server. This future typically will never actually exit, as it's based on
-    // the `TcpListener::incoming` stream of sockets which typically doesn't get
-    // terminated.
-    //
-    // In any case, first up the `buffer` and `listener` values above are both
-    // futures for the values they'll eventually hold. We use `join` to wait for
-    // them to both resolve. Once they're ready, the we pull out the `Stream` of
-    // incoming connections on the socket, and we create a client for each one
-    // with references to the resources we created above.
-    //
-    // After the clients are created, we register a completion callback with
-    // them to print out what happened, and then we crucially call the
-    // `.forget()` function which allows the client to progress concurrently to
-    // the main server itself.
-    //
-    // Note that the usage of `then` and `.forget()` also disconnects errors in
-    // the clients from errors in the server itself. If any client hits an I/O
-    // error it'll cancel that one client, but all others will be unaffected.
-    let server = buffer.join(listener).and_then(move |(buffer, listener)| {
-        println!("Listening for socks5 proxy connections on {}", addr);
-        let clients = listener.incoming().map(move |(socket, addr)| {
-            (Client {
-                buffer: buffer.clone(),
-                pool: pool.clone(),
-                handle: handle.clone(),
-            }.serve(socket), addr)
-        });
-
-        clients.for_each(|(client, addr)| {
-            client.then(move |res| {
-                match res {
-                    Ok((a, b)) => {
-                        println!("proxied {}/{} bytes for {}", a, b, addr)
-                    }
-                    Err(e) => println!("error for {}: {}", addr, e),
+    // Construct a future representing our server. This future processes all
+    // incoming connections and spawns a new task for each client which will do
+    // the proxy work.
+    println!("Listening for socks5 proxy connections on {}", addr);
+    let clients = listener.incoming().map(move |(socket, addr)| {
+        (Client {
+            buffer: buffer.clone(),
+            pool: pool.clone(),
+            handle: handle.clone(),
+        }.serve(socket), addr)
+    });
+    let server = clients.for_each(|(client, addr)| {
+        pin.spawn(client.then(move |res| {
+            match res {
+                Ok((a, b)) => {
+                    println!("proxied {}/{} bytes for {}", a, b, addr)
                 }
-                futures::finished::<_, io::Error>(())
-            }).forget();
-            Ok(())
-        })
+                Err(e) => println!("error for {}: {}", addr, e),
+            }
+            futures::finished(())
+        }));
+        Ok(())
     });
 
     // Now that we've got our future read to go, let's run it!
@@ -131,33 +112,10 @@ fn main() {
     lp.run(server).unwrap();
 }
 
-// A simple global buffer abstraction to mostly just avoid writing the `inner`
-// type in multiple places!
-//
-// This global buffer is based on the `LoopData` abstraction which represents
-// data owned by one particular thread, in this ase the event loop. This type
-// will be referenced in each client, so we layer a `RefCell` to promote our
-// shared borrow to a mutable borrow amongst all the clients (more on this
-// later).
-#[derive(Clone)]
-struct GlobalBuffer {
-    inner: Arc<LoopData<RefCell<Vec<u8>>>>,
-}
-
-impl GlobalBuffer {
-    fn new(lp: &Loop, size: usize) -> IoFuture<GlobalBuffer> {
-        lp.handle().add_loop_data(move |_| {
-            RefCell::new(vec![0u8; size])
-        }).map(|data| {
-            GlobalBuffer { inner: Arc::new(data) }
-        }).boxed()
-    }
-}
-
 // Data used to when processing a client to perform various operations over its
 // lifetime.
 struct Client {
-    buffer: GlobalBuffer,
+    buffer: Rc<RefCell<Vec<u8>>>,
     pool: CpuPool,
     handle: LoopHandle,
 }
@@ -178,8 +136,9 @@ impl Client {
     ///
     /// Once we've got the version byte, we then delegate to the below
     /// `serve_vX` methods depending on which version we found.
-    fn serve(self, conn: TcpStream) -> IoFuture<(u64, u64)> {
-        read_exact(conn, [0u8]).and_then(|(conn, buf)| {
+    fn serve(self, conn: TcpStream)
+              -> Box<Future<Item=(u64, u64), Error=io::Error>> {
+        Box::new(read_exact(conn, [0u8]).and_then(|(conn, buf)| {
             match buf[0] {
                 v5::VERSION => self.serve_v5(conn),
                 v4::VERSION => self.serve_v4(conn),
@@ -190,11 +149,12 @@ impl Client {
                 // helper function, `other`, to create an error quickly.
                 _ => futures::failed(other("unknown version")).boxed(),
             }
-        }).boxed()
+        }))
     }
 
     /// Current SOCKSv4 is not implemented, but v5 below has more fun details!
-    fn serve_v4(self, _conn: TcpStream) -> IoFuture<(u64, u64)> {
+    fn serve_v4(self, _conn: TcpStream)
+                -> Box<Future<Item=(u64, u64), Error=io::Error>> {
         futures::failed(other("unimplemented")).boxed()
     }
 
@@ -209,7 +169,8 @@ impl Client {
     /// necessary, but without them the compiler is pessimistically slow!
     /// Essentially, the `.boxed()` annotations here improve compile times, but
     /// are otherwise not necessary.
-    fn serve_v5(self, conn: TcpStream) -> IoFuture<(u64, u64)> {
+    fn serve_v5(self, conn: TcpStream)
+                -> Box<Future<Item=(u64, u64), Error=io::Error>> {
         // First part of the SOCKSv5 protocol is to negotiate a number of
         // "methods". These methods can typically be used for various kinds of
         // proxy authentication and such, but for this server we only implement
@@ -232,7 +193,7 @@ impl Client {
             } else {
                 Err(other("no supported method given"))
             }
-        });
+        }).boxed();
 
         // After we've concluded that one of the client's supported methods is
         // `METH_NO_AUTH`, we "ack" this to the client by sending back that
@@ -344,9 +305,7 @@ impl Client {
                     read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
                     }).and_then(move |(conn, buf)| {
-                        pool.execute(move || resolve(&buf))
-                            .map_err(|e| other(&format!("panic: {:?}", e)))
-                            .and_then(|e| e)
+                        pool.spawn(futures::lazy(move || resolve(&buf)))
                             .map(|addr| (conn, addr))
                     }).boxed()
                 }
@@ -504,14 +463,14 @@ impl Client {
         // the connection. These two futures are `join`ed together to represent
         // the proxy operation happening.
         let buffer = self.buffer.clone();
-        pair.and_then(|(c1, c2)| {
-            let c1 = Arc::new(c1);
-            let c2 = Arc::new(c2);
+        Box::new(pair.and_then(|(c1, c2)| {
+            let c1 = Rc::new(c1);
+            let c2 = Rc::new(c2);
 
             let half1 = Transfer::new(c1.clone(), c2.clone(), buffer.clone());
             let half2 = Transfer::new(c2, c1, buffer);
             half1.join(half2)
-        }).boxed()
+        }))
     }
 }
 
@@ -525,20 +484,20 @@ impl Client {
 /// be implemented with just a trait impl!
 struct Transfer {
     // The two I/O objects we'll be reading.
-    reader: Arc<TcpStream>,
-    writer: Arc<TcpStream>,
+    reader: Rc<TcpStream>,
+    writer: Rc<TcpStream>,
 
     // The shared global buffer that all connections on our server are using.
-    buf: GlobalBuffer,
+    buf: Rc<RefCell<Vec<u8>>>,
 
     // The number of bytes we've written so far.
     amt: u64,
 }
 
 impl Transfer {
-    fn new(reader: Arc<TcpStream>,
-           writer: Arc<TcpStream>,
-           buffer: GlobalBuffer) -> Transfer {
+    fn new(reader: Rc<TcpStream>,
+           writer: Rc<TcpStream>,
+           buffer: Rc<RefCell<Vec<u8>>>) -> Transfer {
         Transfer {
             reader: reader,
             writer: writer,
@@ -552,7 +511,6 @@ impl Transfer {
 // use any combinators, and shows how you might implement it in custom
 // situations if needed.
 impl Future for Transfer {
-
     // Our future resolves to the number of bytes transferred, or an I/O error
     // that happens during the connection, if any.
     type Item = u64;
@@ -572,38 +530,7 @@ impl Future for Transfer {
     /// bytes were transferred), so we don't need to maintain state beyond that
     /// point.
     fn poll(&mut self) -> Poll<u64, io::Error> {
-        // First up, let's get access to our buffer we're going to read/write
-        // into. This is actually a nontrivial operation as the buffer is not
-        // owned by this future!
-        //
-        // Recall that the buffer here is an instance of `LoopData`, which means
-        // that the data is actually owned by the event loop thread. This call
-        // to `poll` may not actually be running on the right thread, for
-        // example this could execute as part of the completion of our DNS name
-        // resolution on one of our worker threads.
-        //
-        // If we're not running on the event loop thread, however, this is
-        // signaled by the `get` method returning `None`. In that case we ask
-        // the `task` to get polled on the event loop's executor, which we
-        // extract with `LoopData::executor`, and then we return that we're not
-        // ready yet.
-        //
-        // By following this protocol we can ensure that eventually (in a prompt
-        // fashion) we'll make our way over to the event loop thread and get
-        // poll'd there, where `Some` will be returned and we can make progress.
-        let buffer = match self.buf.inner.get() {
-            Some(buf) => buf,
-            None => {
-                task::poll_on(self.buf.inner.executor());
-                return Poll::NotReady
-            }
-        };
-
-        // Now that we're firmly planted on the event loop thread, we know that
-        // the block below is the only block which needs mutable access to the
-        // buffer, so we can use the `RefCell` method of promoting our shared
-        // reference to the buffer to a mutable one.
-        let mut buffer = buffer.borrow_mut();
+        let mut buffer = self.buf.borrow_mut();
 
         // Here we loop over the two TCP halves, reading all data from one
         // connection and writing it to another. The crucial performance aspect
