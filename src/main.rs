@@ -43,6 +43,7 @@ extern crate log;
 extern crate env_logger;
 #[macro_use]
 extern crate futures;
+#[macro_use]
 extern crate tokio_core;
 extern crate futures_cpupool;
 
@@ -538,15 +539,8 @@ impl Future for Transfer {
         // the write half are ready on the connection, allowing the buffer to
         // only be temporarily used in a small window for all connections.
         loop {
-            match try_poll!(self.reader.poll_read()) {
-                Ok(_) => {}
-                Err(e) => return Poll::Err(e),
-            }
-
-            match try_poll!(self.writer.poll_write()) {
-                Ok(_) => {}
-                Err(e) => return Poll::Err(e),
-            }
+            try_ready!(self.reader.poll_read());
+            try_ready!(self.writer.poll_write());
 
             // TODO: This exact logic for reading/writing amounts may need an
             //       update
@@ -576,16 +570,10 @@ impl Future for Transfer {
             // This means that we may trip the assert below, but it should be
             // relatively easily fixable with the strategy above!
 
-            let n = match (&*self.reader).read(&mut buffer) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Poll::NotReady
-                }
-                Err(e) => return Poll::Err(e),
-            };
+            let n = try_nb!((&*self.reader).read(&mut buffer));
             if n == 0 {
-                let res = self.writer.shutdown(Shutdown::Write);
-                return res.map(|()| self.amt).into()
+                try!(self.writer.shutdown(Shutdown::Write));
+                return Ok(self.amt.into())
             }
             self.amt += n as u64;
 
@@ -593,10 +581,8 @@ impl Future for Transfer {
             // that would play into the logic mentioned above (tracking read
             // rates and write rates), so we just ferry along that error for
             // now.
-            match (&*self.writer).write(&buffer[..n]) {
-                Ok(m) => assert_eq!(n, m),
-                Err(e) => return Poll::Err(e),
-            }
+            let m = try!((&*self.writer).write(&buffer[..n]));
+            assert_eq!(n, m);
         }
     }
 }
