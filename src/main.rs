@@ -56,10 +56,11 @@ use std::net::Shutdown;
 use std::str;
 use std::time::Duration;
 
-use futures::{Future, Poll};
+use futures::{Future, Poll, Async};
 use futures::stream::Stream;
 use futures_cpupool::CpuPool;
-use tokio_core::{Loop, LoopHandle, TcpStream};
+use tokio_core::reactor::{Core, Handle, Timeout};
+use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::io::{read_exact, write_all, Window};
 
 fn main() {
@@ -74,12 +75,11 @@ fn main() {
     // Here we create the global event loop, our worker thread pool to perform
     // DNS name resolution, the global buffer that all threads will read/write
     // into, and finally binding the TCP listener itself.
-    let mut lp = Loop::new().unwrap();
+    let mut lp = Core::new().unwrap();
     let pool = CpuPool::new(4);
     let buffer = Rc::new(RefCell::new(vec![0; 64 * 1024]));
     let handle = lp.handle();
-    let listener = lp.run(handle.clone().tcp_listen(&addr)).unwrap();
-    let pin = lp.pin();
+    let listener = TcpListener::bind(&addr, &handle).unwrap();
 
     // Construct a future representing our server. This future processes all
     // incoming connections and spawns a new task for each client which will do
@@ -92,8 +92,9 @@ fn main() {
             handle: handle.clone(),
         }.serve(socket), addr)
     });
+    let handle = lp.handle();
     let server = clients.for_each(|(client, addr)| {
-        pin.spawn(client.then(move |res| {
+        handle.spawn(client.then(move |res| {
             match res {
                 Ok((a, b)) => {
                     println!("proxied {}/{} bytes for {}", a, b, addr)
@@ -118,7 +119,7 @@ fn main() {
 struct Client {
     buffer: Rc<RefCell<Vec<u8>>>,
     pool: CpuPool,
-    handle: LoopHandle,
+    handle: Handle,
 }
 
 impl Client {
@@ -330,17 +331,17 @@ impl Client {
         // to the next stage of the SOCKSv5 handshake, but we keep ahold of any
         // possible error in the connection phase to handle it in a moment.
         let handle = self.handle.clone();
-        let connected = addr.and_then(|(c, addr)| {
+        let connected = mybox(addr.and_then(move |(c, addr)| {
             debug!("proxying to {}", addr);
-            handle.tcp_connect(&addr).then(move |c2| Ok((c, c2, addr)))
-        }).boxed();
+            TcpStream::connect(&addr, &handle).then(move |c2| Ok((c, c2, addr)))
+        }));
 
         // Once we've gotten to this point, we're ready for the final part of
         // the SOCKSv5 handshake. We've got in our hands (c2) the client we're
         // going to proxy data to, so we write out relevant information to the
         // original client (c1) the "response packet" which is the final part of
         // this handshake.
-        let handshake_finish = connected.and_then(|(c1, c2, addr)| {
+        let handshake_finish = mybox(connected.and_then(|(c1, c2, addr)| {
             let mut resp = [0u8; 32];
 
             // VER - protocol version
@@ -405,7 +406,7 @@ impl Client {
             write_all(c1, w).and_then(|(c1, _)| {
                 c2.map(|c2| (c1, c2))
             })
-        }).boxed();
+        }));
 
         // Phew! If you've gotten this far, then we're now entirely done with
         // the entire SOCKSv5 handshake!
@@ -419,37 +420,35 @@ impl Client {
         // seconds. We then apply this timeout to the entire handshake all at
         // once by performing a `select` between the timeout and the handshake
         // itself.
-        let timeout = self.handle.clone().timeout(Duration::new(10, 0));
-        let pair = timeout.and_then(|timeout| {
-            handshake_finish.map(Ok).select(timeout.map(Err)).then(|res| {
-                match res {
-                    // The handshake finished before the timeout fired, so we
-                    // drop the future representing the timeout, canceling the
-                    // timeout, and then return the pair of connections the
-                    // handshake resolved with.
-                    Ok((Ok(pair), _timeout)) => Ok(pair),
+        let timeout = Timeout::new(Duration::new(10, 0), &self.handle).unwrap();
+        let pair = mybox(handshake_finish.map(Ok).select(timeout.map(Err)).then(|res| {
+            match res {
+                // The handshake finished before the timeout fired, so we
+                // drop the future representing the timeout, canceling the
+                // timeout, and then return the pair of connections the
+                // handshake resolved with.
+                Ok((Ok(pair), _timeout)) => Ok(pair),
 
-                    // The timeout fired before the handshake finished. In this
-                    // case we drop the future representing the handshake, which
-                    // cleans up the associated connection and all other
-                    // resources.
-                    //
-                    // This automatically "cancels" any I/O associated with the
-                    // handshake: reads, writes, TCP connects, etc. All of those
-                    // I/O resources are owned by the future, so if we drop the
-                    // future they're all released!
-                    Ok((Err(()), _handshake)) => {
-                        Err(other("timeout during handshake"))
-                    }
-
-                    // One of the futures (handshake or timeout) hit an error
-                    // along the way. We're not entirely sure which at this
-                    // point, but in any case that shouldn't happen, so we just
-                    // keep propagating along the error.
-                    Err((e, _other)) => Err(e),
+                // The timeout fired before the handshake finished. In this
+                // case we drop the future representing the handshake, which
+                // cleans up the associated connection and all other
+                // resources.
+                //
+                // This automatically "cancels" any I/O associated with the
+                // handshake: reads, writes, TCP connects, etc. All of those
+                // I/O resources are owned by the future, so if we drop the
+                // future they're all released!
+                Ok((Err(()), _handshake)) => {
+                    Err(other("timeout during handshake"))
                 }
-            })
-        }).boxed();
+
+                // One of the futures (handshake or timeout) hit an error
+                // along the way. We're not entirely sure which at this
+                // point, but in any case that shouldn't happen, so we just
+                // keep propagating along the error.
+                Err((e, _other)) => Err(e),
+            }
+        }));
 
         // At this point we've *actually* finished the handshake. Not only have
         // we read/written all the relevant bytes, but we've also managed to
@@ -464,7 +463,7 @@ impl Client {
         // the connection. These two futures are `join`ed together to represent
         // the proxy operation happening.
         let buffer = self.buffer.clone();
-        Box::new(pair.and_then(|(c1, c2)| {
+        mybox(pair.and_then(|(c1, c2)| {
             let c1 = Rc::new(c1);
             let c2 = Rc::new(c2);
 
@@ -473,6 +472,10 @@ impl Client {
             half1.join(half2)
         }))
     }
+}
+
+fn mybox<F: Future + 'static>(f: F) -> Box<Future<Item=F::Item, Error=F::Error>> {
+    Box::new(f)
 }
 
 /// A future representing reading all data from one side of a proxy connection
@@ -539,8 +542,11 @@ impl Future for Transfer {
         // the write half are ready on the connection, allowing the buffer to
         // only be temporarily used in a small window for all connections.
         loop {
-            try_ready!(self.reader.poll_read());
-            try_ready!(self.writer.poll_write());
+            let read_ready = self.reader.poll_read().is_ready();
+            let write_ready = self.writer.poll_write().is_ready();
+            if !read_ready || !write_ready {
+                return Ok(Async::NotReady)
+            }
 
             // TODO: This exact logic for reading/writing amounts may need an
             //       update
