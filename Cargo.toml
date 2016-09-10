@@ -5,9 +5,9 @@ authors = ["Alex Crichton <alex@alexcrichton.com>"]
 
 [dependencies]
 log = "0.3"
-futures = { git = "https://github.com/alexcrichton/futures-rs" }
-futures-cpupool = { git = "https://github.com/alexcrichton/futures-rs" }
-tokio-core = { git = "https://github.com/tokio-rs/tokio-core" }
+futures = "0.1"
+futures-cpupool = "0.1"
+tokio-core = "0.1"
 env_logger = "0.3"
 
 [dev-dependencies]
