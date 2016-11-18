@@ -106,7 +106,7 @@ fn main() {
         Ok(())
     });
 
-    // Now that we've got our future read to go, let's run it!
+    // Now that we've got our future ready to go, let's run it!
     //
     // This `run` method will return the resolution of the future itself, but
     // our `server` futures will resolve to `io::Result<()>`, so we just want to
