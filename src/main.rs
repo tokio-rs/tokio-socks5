@@ -45,11 +45,12 @@ extern crate env_logger;
 extern crate futures;
 #[macro_use]
 extern crate tokio_core;
-extern crate futures_cpupool;
+extern crate trust_dns;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::env;
+use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::net::Shutdown;
@@ -58,10 +59,13 @@ use std::time::Duration;
 
 use futures::{Future, Poll, Async};
 use futures::stream::Stream;
-use futures_cpupool::CpuPool;
 use tokio_core::reactor::{Core, Handle, Timeout};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::io::{read_exact, write_all, Window};
+use trust_dns::op::{Message, ResponseCode};
+use trust_dns::rr::{DNSClass, Name, RData, RecordType};
+use trust_dns::client::{ClientFuture, ClientHandle};
+use trust_dns::udp::{UdpClientStream};
 
 fn main() {
     drop(env_logger::init());
@@ -70,13 +74,13 @@ fn main() {
     // back to just some localhost default.
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
     let addr = addr.parse::<SocketAddr>().unwrap();
+    let dns = Rc::new("8.8.8.8:53".parse::<SocketAddr>().unwrap());
 
     // Initialize the various data structures we're going to use in our server.
     // Here we create the global event loop, our worker thread pool to perform
     // DNS name resolution, the global buffer that all threads will read/write
     // into, and finally binding the TCP listener itself.
     let mut lp = Core::new().unwrap();
-    let pool = CpuPool::new(4);
     let buffer = Rc::new(RefCell::new(vec![0; 64 * 1024]));
     let handle = lp.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
@@ -88,7 +92,7 @@ fn main() {
     let clients = listener.incoming().map(move |(socket, addr)| {
         (Client {
             buffer: buffer.clone(),
-            pool: pool.clone(),
+	    dns: dns.clone(),
             handle: handle.clone(),
         }.serve(socket), addr)
     });
@@ -118,7 +122,7 @@ fn main() {
 // lifetime.
 struct Client {
     buffer: Rc<RefCell<Vec<u8>>>,
-    pool: CpuPool,
+    dns: Rc<SocketAddr>,
     handle: Handle,
 }
 
@@ -239,26 +243,27 @@ impl Client {
         //
         // Depending on the address type, we then delegate to different futures
         // to implement that particular address format.
+	let handle = self.handle.clone();
+	let dns = self.dns.clone();
         let resv = command.and_then(|c| read_exact(c, [0u8]).map(|c| c.0));
         let atyp = resv.and_then(|c| read_exact(c, [0u8]));
-        let pool = self.pool.clone();
-        let addr = atyp.and_then(|(c, buf)| {
+        let addr = mybox(atyp.and_then(|(c, buf)| {
             match buf[0] {
                 // For IPv4 addresses, we read the 4 bytes for the address as
                 // well as 2 bytes for the port.
                 v5::ATYP_IPV4 => {
-                    read_exact(c, [0u8; 6]).map(|(c, buf)| {
+                    mybox(read_exact(c, [0u8; 6]).map(|(c, buf)| {
                         let addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
                         let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
                         let addr = SocketAddrV4::new(addr, port);
                         (c, SocketAddr::V4(addr))
-                    }).boxed()
+                    }))
                 }
 
                 // For IPv6 addresses there's 16 bytes of an address plus two
                 // bytes for a port, so we read that off and then keep going.
                 v5::ATYP_IPV6 => {
-                    read_exact(c, [0u8; 18]).map(|(conn, buf)| {
+                    mybox(read_exact(c, [0u8; 18]).map(|(conn, buf)| {
                         let a = ((buf[0] as u16) << 8) | (buf[1] as u16);
                         let b = ((buf[2] as u16) << 8) | (buf[3] as u16);
                         let c = ((buf[4] as u16) << 8) | (buf[5] as u16);
@@ -271,7 +276,7 @@ impl Client {
                         let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
                         let addr = SocketAddrV6::new(addr, port, 0, 0);
                         (conn, SocketAddr::V6(addr))
-                    }).boxed()
+                    }))
                 }
 
                 // The SOCKSv5 protocol not only supports proxying to specific
@@ -304,19 +309,24 @@ impl Client {
                 // `io::Result<SocketAddr>`, and then we transform the future
                 // type back to match what's above as well.
                 v5::ATYP_DOMAIN => {
-                    read_exact(c, [0u8]).and_then(|(conn, buf)| {
+                    mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
                     }).and_then(move |(conn, buf)| {
-                        pool.spawn(futures::lazy(move || resolve(&buf)))
-                            .map(|addr| (conn, addr))
-                    }).boxed()
+			let (name, port) = try!(name_port(&buf));
+			let (stream, sender) = UdpClientStream::new(*dns.clone(), handle.clone());
+			let client = ClientFuture::new(stream, sender, handle.clone(), None);
+			let query = client.query(name, DNSClass::IN, RecordType::A).map(move |response| {
+			    get_addr(response, port)
+			});
+			Ok((conn, *dns))
+                    }))
                 }
                 n => {
                     let msg = format!("unknown ATYP received: {}", n);
-                    futures::failed(other(&msg)).boxed()
+                    mybox(futures::failed(other(&msg)))
                 }
             }
-        }).boxed();
+        }));
 
         // Now that we've got a socket address to connect to, let's actually
         // create a connection to that socket!
@@ -597,18 +607,9 @@ fn other(desc: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, desc)
 }
 
-/// Performs *blocking* name resolution of the DNS name in `addr_buf`, returning
-/// the first `SocketAddr` it corresponds to.
-///
-/// This method is called for resolving a proxy address of type `ATYP_DOMAIN`
-/// above, and to prevent from blocking the event loop this code is executed on
-/// a separate thread pool.
-///
-/// This method just uses the standard library's `to_socket_addrs` method to
-/// perform name resolution, and is otherwise relatively straightforward.
-fn resolve(addr_buf: &[u8]) -> io::Result<SocketAddr> {
-    use std::net::ToSocketAddrs;
-
+// Extracts the name and port from addr_buf and returns them, converting
+// the name to the form that the trust-dns client can use.
+fn name_port(addr_buf: &[u8]) -> io::Result<(Name, u16)> {
     // The last two bytes of the buffer are the port, and the other parts of it
     // are the hostname.
     let hostname = &addr_buf[..addr_buf.len() - 2];
@@ -618,14 +619,28 @@ fn resolve(addr_buf: &[u8]) -> io::Result<SocketAddr> {
     let pos = addr_buf.len() - 2;
     let port = ((addr_buf[pos] as u16) << 8) | (addr_buf[pos + 1] as u16);
 
-    let hostname = format!("{}:{}", hostname, port);
-
-    let mut addrs = try!(hostname.to_socket_addrs());
-    addrs.next().ok_or_else(|| {
-        other("no addresses found during name resolution")
-    })
+    Ok((try!(Name::parse(hostname, Some(&Name::root())).map_err(|e| other(e.description()))), port))
 }
 
+// Extracts the first IPv4 address from the response.
+fn get_addr(response: Message, port: u16) -> io::Result<SocketAddr> {
+    use std::net::IpAddr;
+
+    if response.get_response_code() != ResponseCode::NoError {
+	return Err(other("resolution failed"));
+    }
+    if let Some(ans) = response.get_answers().iter().find(|&ans| {
+	ans.get_rr_type() == RecordType::A
+    }) {
+	let addr = match ans.get_rdata() {
+	    &RData::A(addr) => addr,
+	    _ => unreachable!(),
+	};
+	Ok(SocketAddr::new(IpAddr::V4(addr), port))
+    } else {
+	Err(other("no address records in response"))
+    }
+}
 
 // Various constants associated with the SOCKS protocol
 
