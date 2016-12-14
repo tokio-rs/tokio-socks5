@@ -311,14 +311,22 @@ impl Client {
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
-                    }).and_then(move |(conn, buf)| {
-			let (name, port) = try!(name_port(&buf));
-			let (stream, sender) = UdpClientStream::new(*dns.clone(), handle.clone());
-			let client = ClientFuture::new(stream, sender, handle.clone(), None);
-			let query = client.query(name, DNSClass::IN, RecordType::A).map(move |response| {
-			    get_addr(response, port)
-			});
-			Ok((conn, *dns))
+                    }).and_then(|(conn, buf)| {
+			match name_port(&buf) {
+			    Ok((name, port)) => Ok((name, port, conn)),
+			    Err(e) => Err(e),
+			}
+		    }).and_then(move |(name, port, conn)| {
+			let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
+			let client = ClientFuture::new(stream, sender, handle, None);
+			client.query(name, DNSClass::IN, RecordType::A)
+			      .map_err(|e| other(&format!("dns error: {}", e)))
+			      .and_then(move |response| {
+			    match get_addr(response, port) {
+				Ok(addr) => Ok((conn, addr)),
+				Err(e) => Err(e),
+			    }
+			})
                     }))
                 }
                 n => {
