@@ -21,11 +21,10 @@
 //!   through it. This is achieved by waiting for both ends of the proxy to be
 //!   ready, and then the transfer is done.
 //!
-//! * Initiating a SOCKS proxy connection may involve a DNS lookup, and
-//!   currently this is done using the standard library, which does blocking
-//!   I/O. To prevent the event loop from blocking a worker thread pool is used
-//!   to execute DNS lookups and the results are communicated back to the main
-//!   event loop thread.
+//! * Initiating a SOCKS proxy connection may involve a DNS lookup, which
+//!   is done with the TRust-DNS futures-based resolver. This demonstrates the
+//!   ease of integrating a third-party futures-based library into our futures
+//!   chain.
 //!
 //! * The entire SOCKS handshake is implemented using the various combinators in
 //!   the `futures` crate as well as the `futures_io` crate. The actual proxying
@@ -74,12 +73,14 @@ fn main() {
     // back to just some localhost default.
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
     let addr = addr.parse::<SocketAddr>().unwrap();
+
+    // This is the address of our DNS server. If external servers can't be used
+    // in your environment, substitue your own.
     let dns = Rc::new("8.8.8.8:53".parse::<SocketAddr>().unwrap());
 
     // Initialize the various data structures we're going to use in our server.
-    // Here we create the global event loop, our worker thread pool to perform
-    // DNS name resolution, the global buffer that all threads will read/write
-    // into, and finally binding the TCP listener itself.
+    // Here we create the global buffer that all threads will read/write into
+    // and bind the TCP listener itself.
     let mut lp = Core::new().unwrap();
     let buffer = Rc::new(RefCell::new(vec![0; 64 * 1024]));
     let handle = lp.handle();
@@ -284,30 +285,22 @@ impl Client {
                 // clients to perform hostname lookups within the context of the
                 // proxy server rather than the client itself.
                 //
-                // As of the time of this writing there's not a DNS library
-                // based on futures, but we can take this opportunity to show
-                // how to execute otherwise-blocking computations! The basic
-                // idea is that we'll farm out the DNS resolution work to the
-                // standard library, which performs blocking I/O, onto dedicated
-                // threads for performing these blocking syscalls.
+		// Since the first publication of this code, several
+		// futures-based DNS libraries appeared, and as a demonstration
+		// of integrating third-party asynchronous code into our chain,
+		// we will use one of them, TRust-DNS.
                 //
-                // This'll incur some overhead as we're communicating with
-                // another thread, so this would of course be better to
-                // implement with just pure futures, but that may not always be
-                // possible!
+                // The protocol here is to have the next byte indicate how many
+                // bytes the hostname contains, followed by the hostname and two
+		// bytes for the port. To read this data, we execute two respective
+		// `read_exact` operations to fill up a buffer for the hostname.
                 //
-                // In any case, though, the protocol here is to have the next
-                // byte indicate how many bytes the hostname contains, followed
-                // by the hostname and two bytes for the port. To read this
-                // data, we execute two respective `read_exact` operations to
-                // fill up a buffer for the hostname.
-                //
-                // Finally, to perform the "interesting" part, we use our handle
-                // to the thread pool (the `pool` variable), to execute an
-                // arbitrary computation on a separate thread. This for now is
-                // just the `resolve` function returning an
-                // `io::Result<SocketAddr>`, and then we transform the future
-                // type back to match what's above as well.
+                // Finally, to perform the "interesting" part, we process the
+		// buffer and pass the retrieved hostname to a query future if
+		// it wasn't already recognized as an IP address. The complexity
+		// of this code compared to the synchronous version is a reminder
+		// that there is much more to address resolution than simply
+		// sending a DNS query.
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
@@ -318,6 +311,7 @@ impl Client {
 			}
 		    }).and_then(move |(name, port, conn)| {
 			match name {
+			    UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
 			    UrlHost::Name(name) => mybox({
 				let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
 				let client = ClientFuture::new(stream, sender, handle, None);
@@ -330,7 +324,6 @@ impl Client {
 				    }
 				})
 			    }),
-			    UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
 			}
                     }))
                 }
