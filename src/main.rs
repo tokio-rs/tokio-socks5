@@ -93,7 +93,7 @@ fn main() {
     let clients = listener.incoming().map(move |(socket, addr)| {
         (Client {
             buffer: buffer.clone(),
-	    dns: dns.clone(),
+            dns: dns.clone(),
             handle: handle.clone(),
         }.serve(socket), addr)
     });
@@ -244,8 +244,8 @@ impl Client {
         //
         // Depending on the address type, we then delegate to different futures
         // to implement that particular address format.
-	let handle = self.handle.clone();
-	let dns = self.dns.clone();
+        let handle = self.handle.clone();
+        let dns = self.dns.clone();
         let resv = command.and_then(|c| read_exact(c, [0u8]).map(|c| c.0));
         let atyp = resv.and_then(|c| read_exact(c, [0u8]));
         let addr = mybox(atyp.and_then(|(c, buf)| {
@@ -285,46 +285,46 @@ impl Client {
                 // clients to perform hostname lookups within the context of the
                 // proxy server rather than the client itself.
                 //
-		// Since the first publication of this code, several
-		// futures-based DNS libraries appeared, and as a demonstration
-		// of integrating third-party asynchronous code into our chain,
-		// we will use one of them, TRust-DNS.
+                // Since the first publication of this code, several
+                // futures-based DNS libraries appeared, and as a demonstration
+                // of integrating third-party asynchronous code into our chain,
+                // we will use one of them, TRust-DNS.
                 //
                 // The protocol here is to have the next byte indicate how many
                 // bytes the hostname contains, followed by the hostname and two
-		// bytes for the port. To read this data, we execute two respective
-		// `read_exact` operations to fill up a buffer for the hostname.
+                // bytes for the port. To read this data, we execute two respective
+                // `read_exact` operations to fill up a buffer for the hostname.
                 //
                 // Finally, to perform the "interesting" part, we process the
-		// buffer and pass the retrieved hostname to a query future if
-		// it wasn't already recognized as an IP address. The complexity
-		// of this code compared to the synchronous version is a reminder
-		// that there is much more to address resolution than simply
-		// sending a DNS query.
+                // buffer and pass the retrieved hostname to a query future if
+                // it wasn't already recognized as an IP address. The complexity
+                // of this code compared to the synchronous version is a reminder
+                // that there is much more to address resolution than simply
+                // sending a DNS query.
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
                     }).and_then(|(conn, buf)| {
-			match name_port(&buf) {
-			    Ok((name, port)) => Ok((name, port, conn)),
-			    Err(e) => Err(e),
-			}
-		    }).and_then(move |(name, port, conn)| {
-			match name {
-			    UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
-			    UrlHost::Name(name) => mybox({
-				let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
-				let client = ClientFuture::new(stream, sender, handle, None);
-				client.query(name, DNSClass::IN, RecordType::A)
-				      .map_err(|e| other(&format!("dns error: {}", e)))
-				      .and_then(move |response| {
-				    match get_addr(response, port) {
-					Ok(addr) => Ok((conn, addr)),
-					Err(e) => Err(e),
-				    }
-				})
-			    }),
-			}
+                        match name_port(&buf) {
+                            Ok((name, port)) => Ok((name, port, conn)),
+                            Err(e) => Err(e),
+                        }
+                    }).and_then(move |(name, port, conn)| {
+                        match name {
+                            UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
+                            UrlHost::Name(name) => mybox({
+                                let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
+                                let client = ClientFuture::new(stream, sender, handle, None);
+                                client.query(name, DNSClass::IN, RecordType::A)
+                                      .map_err(|e| other(&format!("dns error: {}", e)))
+                                      .and_then(move |response| {
+                                    match get_addr(response, port) {
+                                        Ok(addr) => Ok((conn, addr)),
+                                        Err(e) => Err(e),
+                                    }
+                                })
+                            }),
+                        }
                     }))
                 }
                 n => {
@@ -634,7 +634,7 @@ fn name_port(addr_buf: &[u8]) -> io::Result<(UrlHost, u16)> {
     let port = ((addr_buf[pos] as u16) << 8) | (addr_buf[pos + 1] as u16);
 
     if let Ok(addr) = (&format!("{}:{}", hostname, port)).parse::<SocketAddr>() {
-	return Ok((UrlHost::Addr(addr), port));
+        return Ok((UrlHost::Addr(addr), port));
     }
     let name = try!(Name::parse(hostname, Some(&Name::root())).map_err(|e| other(e.description())));
     Ok((UrlHost::Name(name), port))
@@ -645,18 +645,18 @@ fn get_addr(response: Message, port: u16) -> io::Result<SocketAddr> {
     use std::net::IpAddr;
 
     if response.get_response_code() != ResponseCode::NoError {
-	return Err(other("resolution failed"));
+        return Err(other("resolution failed"));
     }
     if let Some(ans) = response.get_answers().iter().find(|&ans| {
-	ans.get_rr_type() == RecordType::A
+        ans.get_rr_type() == RecordType::A
     }) {
-	let addr = match ans.get_rdata() {
-	    &RData::A(addr) => addr,
-	    _ => unreachable!(),
-	};
-	Ok(SocketAddr::new(IpAddr::V4(addr), port))
+        let addr = match ans.get_rdata() {
+            &RData::A(addr) => addr,
+            _ => unreachable!(),
+        };
+        Ok(SocketAddr::new(IpAddr::V4(addr), port))
     } else {
-	Err(other("no address records in response"))
+        Err(other("no address records in response"))
     }
 }
 
