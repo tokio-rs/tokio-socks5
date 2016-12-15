@@ -57,7 +57,7 @@ use std::net::Shutdown;
 use std::str;
 use std::time::Duration;
 
-use futures::{Future, Poll, Async};
+use futures::{future, Future, Poll, Async};
 use futures::stream::Stream;
 use tokio_core::reactor::{Core, Handle, Timeout};
 use tokio_core::net::{TcpStream, TcpListener};
@@ -317,16 +317,21 @@ impl Client {
 			    Err(e) => Err(e),
 			}
 		    }).and_then(move |(name, port, conn)| {
-			let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
-			let client = ClientFuture::new(stream, sender, handle, None);
-			client.query(name, DNSClass::IN, RecordType::A)
-			      .map_err(|e| other(&format!("dns error: {}", e)))
-			      .and_then(move |response| {
-			    match get_addr(response, port) {
-				Ok(addr) => Ok((conn, addr)),
-				Err(e) => Err(e),
-			    }
-			})
+			match name {
+			    UrlHost::Name(name) => mybox({
+				let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
+				let client = ClientFuture::new(stream, sender, handle, None);
+				client.query(name, DNSClass::IN, RecordType::A)
+				      .map_err(|e| other(&format!("dns error: {}", e)))
+				      .and_then(move |response| {
+				    match get_addr(response, port) {
+					Ok(addr) => Ok((conn, addr)),
+					Err(e) => Err(e),
+				    }
+				})
+			    }),
+			    UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
+			}
                     }))
                 }
                 n => {
@@ -615,9 +620,17 @@ fn other(desc: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, desc)
 }
 
+enum UrlHost {
+    Name(Name),
+    Addr(SocketAddr),
+}
+
 // Extracts the name and port from addr_buf and returns them, converting
-// the name to the form that the trust-dns client can use.
-fn name_port(addr_buf: &[u8]) -> io::Result<(Name, u16)> {
+// the name to the form that the trust-dns client can use. If the original
+// name can be parsed as an IP address, makes a SocketAddr from that
+// address and the port and returns it; we skip DNS resolution in that
+// case.
+fn name_port(addr_buf: &[u8]) -> io::Result<(UrlHost, u16)> {
     // The last two bytes of the buffer are the port, and the other parts of it
     // are the hostname.
     let hostname = &addr_buf[..addr_buf.len() - 2];
@@ -627,7 +640,11 @@ fn name_port(addr_buf: &[u8]) -> io::Result<(Name, u16)> {
     let pos = addr_buf.len() - 2;
     let port = ((addr_buf[pos] as u16) << 8) | (addr_buf[pos + 1] as u16);
 
-    Ok((try!(Name::parse(hostname, Some(&Name::root())).map_err(|e| other(e.description()))), port))
+    if let Ok(addr) = (&format!("{}:{}", hostname, port)).parse::<SocketAddr>() {
+	return Ok((UrlHost::Addr(addr), port));
+    }
+    let name = try!(Name::parse(hostname, Some(&Name::root())).map_err(|e| other(e.description())));
+    Ok((UrlHost::Name(name), port))
 }
 
 // Extracts the first IPv4 address from the response.
