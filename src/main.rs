@@ -318,7 +318,7 @@ impl Client {
                             UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
                             UrlHost::Name(name) => mybox({
                                 let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
-                                let client = ClientFuture::new(stream, sender, handle, None);
+                                let mut client = ClientFuture::new(stream, sender, handle, None);
                                 client.query(name, DNSClass::IN, RecordType::A)
                                       .map_err(|e| other(&format!("dns error: {}", e)))
                                       .and_then(move |response| {
