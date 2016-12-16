@@ -297,10 +297,15 @@ impl Client {
                 //
                 // Finally, to perform the "interesting" part, we process the
                 // buffer and pass the retrieved hostname to a query future if
-                // it wasn't already recognized as an IP address. The complexity
-                // of this code compared to the synchronous version is a reminder
-                // that there is much more to address resolution than simply
-                // sending a DNS query.
+                // it wasn't already recognized as an IP address. The query is
+                // very basic: it asks for an IPv4 address, and has a single
+                // default timeout of five seconds. We're using TRust-DNS at the
+                // protocol level, so we don't have the functionality normally
+                // expected from a stub resolver, such as IPv6 address lookups,
+                // sorting of answers according to RFC 6724, or more robust
+                // timeout handling. Also, we depend on the upstream resolver for
+                // CNAME lookups.
+                and depend on the upstream resolver for CNAME
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
