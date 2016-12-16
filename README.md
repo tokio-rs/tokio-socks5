@@ -22,6 +22,17 @@ $ export https_proxy=socks5h://localhost:8080
 $ curl -v https://www.google.com
 ```
 
+If you have an older version of libcurl which doesn't support the `socks5h` scheme,
+you can try:
+
+```
+$ curl -v --socks5-hostname localhost:8080 https://www.google.com
+```
+
+The server is hardcoded to use Google's public DNS resolver (IPv4 address 8.8.8.8).
+If you can't use external DNS services, change the address in the source and
+rebuild the server.
+
 # License
 
 `tokio-socks5` is primarily distributed under the terms of both the MIT
