@@ -305,7 +305,6 @@ impl Client {
                 // sorting of answers according to RFC 6724, or more robust
                 // timeout handling. Also, we depend on the upstream resolver for
                 // CNAME lookups.
-                and depend on the upstream resolver for CNAME
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
