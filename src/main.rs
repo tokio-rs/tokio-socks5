@@ -27,9 +27,9 @@
 //!   chain.
 //!
 //! * The entire SOCKS handshake is implemented using the various combinators in
-//!   the `futures` crate as well as the `futures_io` crate. The actual proxying
-//!   of data, however, is implemented through a manual implementation of
-//!   `Future`. This shows how it's easy to transition back and forth between
+//!   the `futures` crate as well as the `tokio_core::io` module. The actual
+//!   proxying of data, however, is implemented through a manual implementation
+//!   of `Future`. This shows how it's easy to transition back and forth between
 //!   the two, choosing whichever is the most appropriate for the situation at
 //!   hand.
 //!
@@ -55,15 +55,15 @@ use std::rc::Rc;
 use std::str;
 use std::time::Duration;
 
-use futures::{future, Future, Poll, Async};
-use futures::stream::Stream;
-use tokio_core::reactor::{Core, Handle, Timeout};
-use tokio_core::net::{TcpStream, TcpListener};
+use futures::future;
+use futures::{Future, Stream, Poll, Async};
 use tokio_core::io::{read_exact, write_all, Window};
+use tokio_core::net::{TcpStream, TcpListener};
+use tokio_core::reactor::{Core, Handle, Timeout};
+use trust_dns::client::{ClientFuture, BasicClientHandle, ClientHandle};
 use trust_dns::op::{Message, ResponseCode};
 use trust_dns::rr::{DNSClass, Name, RData, RecordType};
-use trust_dns::client::{ClientFuture, BasicClientHandle, ClientHandle};
-use trust_dns::udp::{UdpClientStream};
+use trust_dns::udp::UdpClientStream;
 
 fn main() {
     drop(env_logger::init());
@@ -74,15 +74,16 @@ fn main() {
     let addr = addr.parse::<SocketAddr>().unwrap();
 
     // Initialize the various data structures we're going to use in our server.
-    // Here we create the global buffer that all threads will read/write into
-    // and bind the TCP listener itself.
+    // Here we create the event loop, the global buffer that all threads will
+    // read/write into, and the bound TCP listener itself.
     let mut lp = Core::new().unwrap();
     let buffer = Rc::new(RefCell::new(vec![0; 64 * 1024]));
     let handle = lp.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
     // This is the address of our the DNS server we'll send queries to. If
-    // external servers can't be used in your environment, substitue your own.
+    // external servers can't be used in your environment, you can substitue
+    // your own.
     let dns = "8.8.8.8:53".parse().unwrap();
     let (stream, sender) = UdpClientStream::new(dns, handle.clone());
     let client = ClientFuture::new(stream, sender, handle.clone(), None);
@@ -90,6 +91,12 @@ fn main() {
     // Construct a future representing our server. This future processes all
     // incoming connections and spawns a new task for each client which will do
     // the proxy work.
+    //
+    // This essentially means that for all incoming connections, those received
+    // from `listener`, we'll create an instance of `Client` and convert it to a
+    // future representing the completion of handling that client. This future
+    // itself is then *spawned* onto the event loop to ensure that it can
+    // progress concurrently with all other connections.
     println!("Listening for socks5 proxy connections on {}", addr);
     let clients = listener.incoming().map(move |(socket, addr)| {
         (Client {
@@ -107,12 +114,12 @@ fn main() {
                 }
                 Err(e) => println!("error for {}: {}", addr, e),
             }
-            futures::finished(())
+            future::ok(())
         }));
         Ok(())
     });
 
-    // Now that we've got our future ready to go, let's run it!
+    // Now that we've got our server as a future ready to go, let's run it!
     //
     // This `run` method will return the resolution of the future itself, but
     // our `server` futures will resolve to `io::Result<()>`, so we just want to
@@ -155,7 +162,7 @@ impl Client {
                 // which represents that this future has immediately failed. In
                 // this case the type of the future is `io::Error`, so we use a
                 // helper function, `other`, to create an error quickly.
-                _ => futures::failed(other("unknown version")).boxed(),
+                _ => future::err(other("unknown version")).boxed(),
             }
         }))
     }
@@ -163,7 +170,7 @@ impl Client {
     /// Current SOCKSv4 is not implemented, but v5 below has more fun details!
     fn serve_v4(self, _conn: TcpStream)
                 -> Box<Future<Item=(u64, u64), Error=io::Error>> {
-        futures::failed(other("unimplemented")).boxed()
+        future::err(other("unimplemented")).boxed()
     }
 
     /// The meat of a SOCKSv5 handshake.
@@ -185,7 +192,7 @@ impl Client {
         // the `METH_NO_AUTH` method, indicating that we only implement
         // connections that work with no authentication.
         //
-        // Frist here we do the same thing as reading the version byte, we read
+        // First here we do the same thing as reading the version byte, we read
         // a byte indicating how many methods. Afterwards we then read all the
         // methods into a temporary buffer.
         //
@@ -428,11 +435,10 @@ impl Client {
         // feature here where we'll time out any initial connect operations
         // which take too long.
         //
-        // Here we create a timeout future, using the `LoopHandle::timeout`
-        // method, which will create a future that will resolve to `()` in 10
-        // seconds. We then apply this timeout to the entire handshake all at
-        // once by performing a `select` between the timeout and the handshake
-        // itself.
+        // Here we create a timeout future, using the `Timeout::new` method,
+        // which will create a future that will resolve to `()` in 10 seconds.
+        // We then apply this timeout to the entire handshake all at once by
+        // performing a `select` between the timeout and the handshake itself.
         let timeout = Timeout::new(Duration::new(10, 0), &self.handle).unwrap();
         let pair = mybox(handshake_finish.map(Ok).select(timeout.map(Err)).then(|res| {
             match res {
@@ -471,7 +477,7 @@ impl Client {
         // and for between the two connections. That is, data is read from `c1`
         // and written to `c2`, and vice versa.
         //
-        // To accomplish this, we put both sockets into their own `Arc` and then
+        // To accomplish this, we put both sockets into their own `Rc` and then
         // create two independent `Transfer` futures representing each half of
         // the connection. These two futures are `join`ed together to represent
         // the proxy operation happening.
