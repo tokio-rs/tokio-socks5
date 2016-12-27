@@ -47,12 +47,11 @@ extern crate tokio_core;
 extern crate trust_dns;
 
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::env;
-use std::error::Error;
 use std::io::{self, Read, Write};
+use std::net::{Shutdown, IpAddr};
 use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-use std::net::Shutdown;
+use std::rc::Rc;
 use std::str;
 use std::time::Duration;
 
@@ -63,7 +62,7 @@ use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::io::{read_exact, write_all, Window};
 use trust_dns::op::{Message, ResponseCode};
 use trust_dns::rr::{DNSClass, Name, RData, RecordType};
-use trust_dns::client::{ClientFuture, ClientHandle};
+use trust_dns::client::{ClientFuture, BasicClientHandle, ClientHandle};
 use trust_dns::udp::{UdpClientStream};
 
 fn main() {
@@ -74,10 +73,6 @@ fn main() {
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
     let addr = addr.parse::<SocketAddr>().unwrap();
 
-    // This is the address of our DNS server. If external servers can't be used
-    // in your environment, substitue your own.
-    let dns = Rc::new("8.8.8.8:53".parse::<SocketAddr>().unwrap());
-
     // Initialize the various data structures we're going to use in our server.
     // Here we create the global buffer that all threads will read/write into
     // and bind the TCP listener itself.
@@ -86,6 +81,12 @@ fn main() {
     let handle = lp.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
+    // This is the address of our the DNS server we'll send queries to. If
+    // external servers can't be used in your environment, substitue your own.
+    let dns = "8.8.8.8:53".parse().unwrap();
+    let (stream, sender) = UdpClientStream::new(dns, handle.clone());
+    let client = ClientFuture::new(stream, sender, handle.clone(), None);
+
     // Construct a future representing our server. This future processes all
     // incoming connections and spawns a new task for each client which will do
     // the proxy work.
@@ -93,7 +94,7 @@ fn main() {
     let clients = listener.incoming().map(move |(socket, addr)| {
         (Client {
             buffer: buffer.clone(),
-            dns: dns.clone(),
+            dns: client.clone(),
             handle: handle.clone(),
         }.serve(socket), addr)
     });
@@ -123,7 +124,7 @@ fn main() {
 // lifetime.
 struct Client {
     buffer: Rc<RefCell<Vec<u8>>>,
-    dns: Rc<SocketAddr>,
+    dns: BasicClientHandle,
     handle: Handle,
 }
 
@@ -244,11 +245,10 @@ impl Client {
         //
         // Depending on the address type, we then delegate to different futures
         // to implement that particular address format.
-        let handle = self.handle.clone();
-        let dns = self.dns.clone();
+        let mut dns = self.dns.clone();
         let resv = command.and_then(|c| read_exact(c, [0u8]).map(|c| c.0));
         let atyp = resv.and_then(|c| read_exact(c, [0u8]));
-        let addr = mybox(atyp.and_then(|(c, buf)| {
+        let addr = mybox(atyp.and_then(move |(c, buf)| {
             match buf[0] {
                 // For IPv4 addresses, we read the 4 bytes for the address as
                 // well as 2 bytes for the port.
@@ -292,48 +292,41 @@ impl Client {
                 //
                 // The protocol here is to have the next byte indicate how many
                 // bytes the hostname contains, followed by the hostname and two
-                // bytes for the port. To read this data, we execute two respective
-                // `read_exact` operations to fill up a buffer for the hostname.
+                // bytes for the port. To read this data, we execute two
+                // respective `read_exact` operations to fill up a buffer for
+                // the hostname.
                 //
                 // Finally, to perform the "interesting" part, we process the
                 // buffer and pass the retrieved hostname to a query future if
                 // it wasn't already recognized as an IP address. The query is
-                // very basic: it asks for an IPv4 address, and has a single
-                // default timeout of five seconds. We're using TRust-DNS at the
-                // protocol level, so we don't have the functionality normally
-                // expected from a stub resolver, such as IPv6 address lookups,
-                // sorting of answers according to RFC 6724, or more robust
-                // timeout handling. Also, we depend on the upstream resolver for
-                // CNAME lookups.
+                // very basic: it asks for an IPv4 address with a timeout of
+                // five seconds. We're using TRust-DNS at the protocol level,
+                // so we don't have the functionality normally expected from a
+                // stub resolver, such as sorting of answers according to RFC
+                // 6724 or more robust timeout handling or resolving CNAME
+                // lookups.
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
-                    }).and_then(|(conn, buf)| {
-                        match name_port(&buf) {
-                            Ok((name, port)) => Ok((name, port, conn)),
-                            Err(e) => Err(e),
-                        }
-                    }).and_then(move |(name, port, conn)| {
-                        match name {
-                            UrlHost::Addr(addr) => mybox(future::ok((conn, addr))),
-                            UrlHost::Name(name) => mybox({
-                                let (stream, sender) = UdpClientStream::new(*dns, handle.clone());
-                                let mut client = ClientFuture::new(stream, sender, handle, None);
-                                client.query(name, DNSClass::IN, RecordType::A)
+                    }).and_then(move |(conn, buf)| {
+                        let (name, port) = match name_port(&buf) {
+                            Ok(UrlHost::Name(name, port)) => (name, port),
+                            Ok(UrlHost::Addr(addr)) => {
+                                return mybox(future::ok((conn, addr)))
+                            }
+                            Err(e) => return mybox(future::err(e)),
+                        };
+
+                        let ipv4 = dns.query(name, DNSClass::IN, RecordType::A)
                                       .map_err(|e| other(&format!("dns error: {}", e)))
-                                      .and_then(move |response| {
-                                    match get_addr(response, port) {
-                                        Ok(addr) => Ok((conn, addr)),
-                                        Err(e) => Err(e),
-                                    }
-                                })
-                            }),
-                        }
+                                      .and_then(move |r| get_addr(r, port));
+                        mybox(ipv4.map(|addr| (conn, addr)))
                     }))
                 }
+
                 n => {
                     let msg = format!("unknown ATYP received: {}", n);
-                    mybox(futures::failed(other(&msg)))
+                    mybox(future::err(other(&msg)))
                 }
             }
         }));
@@ -618,7 +611,7 @@ fn other(desc: &str) -> io::Error {
 }
 
 enum UrlHost {
-    Name(Name),
+    Name(Name, u16),
     Addr(SocketAddr),
 }
 
@@ -627,7 +620,7 @@ enum UrlHost {
 // name can be parsed as an IP address, makes a SocketAddr from that
 // address and the port and returns it; we skip DNS resolution in that
 // case.
-fn name_port(addr_buf: &[u8]) -> io::Result<(UrlHost, u16)> {
+fn name_port(addr_buf: &[u8]) -> io::Result<UrlHost> {
     // The last two bytes of the buffer are the port, and the other parts of it
     // are the hostname.
     let hostname = &addr_buf[..addr_buf.len() - 2];
@@ -637,30 +630,31 @@ fn name_port(addr_buf: &[u8]) -> io::Result<(UrlHost, u16)> {
     let pos = addr_buf.len() - 2;
     let port = ((addr_buf[pos] as u16) << 8) | (addr_buf[pos + 1] as u16);
 
-    if let Ok(addr) = (&format!("{}:{}", hostname, port)).parse::<SocketAddr>() {
-        return Ok((UrlHost::Addr(addr), port));
+    if let Ok(ip) = hostname.parse() {
+        return Ok(UrlHost::Addr(SocketAddr::new(ip, port)))
     }
-    let name = try!(Name::parse(hostname, Some(&Name::root())).map_err(|e| other(e.description())));
-    Ok((UrlHost::Name(name), port))
+    let name = try!(Name::parse(hostname, Some(&Name::root())).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, e.to_string())
+    }));
+    Ok(UrlHost::Name(name, port))
 }
 
-// Extracts the first IPv4 address from the response.
+// Extracts the first IP address from the response.
 fn get_addr(response: Message, port: u16) -> io::Result<SocketAddr> {
-    use std::net::IpAddr;
-
     if response.get_response_code() != ResponseCode::NoError {
         return Err(other("resolution failed"));
     }
-    if let Some(ans) = response.get_answers().iter().find(|&ans| {
-        ans.get_rr_type() == RecordType::A
-    }) {
-        let addr = match ans.get_rdata() {
-            &RData::A(addr) => addr,
-            _ => unreachable!(),
-        };
-        Ok(SocketAddr::new(IpAddr::V4(addr), port))
-    } else {
-        Err(other("no address records in response"))
+    let addr = response.get_answers().iter().filter_map(|ans| {
+        match *ans.get_rdata() {
+            RData::A(addr) => Some(IpAddr::V4(addr)),
+            RData::AAAA(addr) => Some(IpAddr::V6(addr)),
+            _ => None,
+        }
+    }).next();
+
+    match addr {
+        Some(addr) => Ok(SocketAddr::new(addr, port)),
+        None => Err(other("no address records in response")),
     }
 }
 
