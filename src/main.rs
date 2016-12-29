@@ -81,7 +81,7 @@ fn main() {
     let handle = lp.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
-    // This is the address of our the DNS server we'll send queries to. If
+    // This is the address of the DNS server we'll send queries to. If
     // external servers can't be used in your environment, you can substitue
     // your own.
     let dns = "8.8.8.8:53".parse().unwrap();
@@ -310,7 +310,7 @@ impl Client {
                 // five seconds. We're using TRust-DNS at the protocol level,
                 // so we don't have the functionality normally expected from a
                 // stub resolver, such as sorting of answers according to RFC
-                // 6724 or more robust timeout handling or resolving CNAME
+                // 6724, more robust timeout handling, or resolving CNAME
                 // lookups.
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
