@@ -11,4 +11,4 @@ env_logger = "0.3"
 trust-dns = { version = "0.9.2", default-features = false }
 
 [dev-dependencies]
-curl = "0.3"
+curl = "0.4"
