@@ -40,10 +40,10 @@
 #[macro_use]
 extern crate log;
 extern crate env_logger;
-#[macro_use]
 extern crate futures;
 #[macro_use]
 extern crate tokio_core;
+extern crate tokio_io;
 extern crate trust_dns;
 
 use std::cell::RefCell;
@@ -57,7 +57,7 @@ use std::time::Duration;
 
 use futures::future;
 use futures::{Future, Stream, Poll, Async};
-use tokio_core::io::{read_exact, write_all, Window};
+use tokio_io::io::{read_exact, write_all, Window};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::{Core, Handle, Timeout};
 use trust_dns::client::{ClientFuture, BasicClientHandle, ClientHandle};
